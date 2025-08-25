@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/textproto"
 	"strconv"
 	"strings"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/gomodule/redigo/redis"
 	"github.com/gorilla/securecookie"
 	"github.com/gorilla/sessions"
+	"golang.org/x/net/http/httpguts"
 )
 
 // sessionExpire defines the duration (in seconds) for which a session will remain valid.
@@ -361,7 +363,8 @@ func (s *RediStore) New(r *http.Request, name string) (*sessions.Session, error)
 	options := *s.Options
 	session.Options = &options
 	session.IsNew = true
-	if c, errCookie := r.Cookie(name); errCookie == nil {
+	//if c, errCookie := r.Cookie(name); errCookie == nil {
+	if c, errCookie := GetCookieFromHeader(r, name); errCookie == nil {
 		err = securecookie.DecodeMulti(name, c.Value, &session.ID, s.Codecs...)
 		if err == nil {
 			ok, err = s.load(session)
@@ -378,7 +381,8 @@ func (s *RediStore) Save(r *http.Request, w http.ResponseWriter, session *sessio
 		if err := s.delete(session); err != nil {
 			return err
 		}
-		http.SetCookie(w, sessions.NewCookie(session.Name(), "", session.Options))
+		// http.SetCookie(w, sessions.NewCookie(session.Name(), "", session.Options))
+		SetCookieToHeader(w, sessions.NewCookie(session.Name(), "", session.Options))
 	} else {
 		// Build an alphanumeric key for the redis store.
 		if session.ID == "" {
@@ -391,7 +395,8 @@ func (s *RediStore) Save(r *http.Request, w http.ResponseWriter, session *sessio
 		if err != nil {
 			return err
 		}
-		http.SetCookie(w, sessions.NewCookie(session.Name(), encoded, session.Options))
+		// http.SetCookie(w, sessions.NewCookie(session.Name(), encoded, session.Options))
+		SetCookieToHeader(w, sessions.NewCookie(session.Name(), encoded, session.Options))
 	}
 	return nil
 }
@@ -413,7 +418,8 @@ func (s *RediStore) Delete(r *http.Request, w http.ResponseWriter, session *sess
 	// Set cookie to expire.
 	options := *session.Options
 	options.MaxAge = -1
-	http.SetCookie(w, sessions.NewCookie(session.Name(), "", &options))
+	// http.SetCookie(w, sessions.NewCookie(session.Name(), "", &options))
+	SetCookieToHeader(w, sessions.NewCookie(session.Name(), "", session.Options))
 	// Clear session values.
 	for k := range session.Values {
 		delete(session.Values, k)
@@ -500,4 +506,88 @@ func (s *RediStore) delete(session *sessions.Session) error {
 		return err
 	}
 	return nil
+}
+
+func SetCookieToHeader(w http.ResponseWriter, cookie *http.Cookie) {
+	if v := cookie.String(); v != "" {
+		w.Header().Add("X-Forget-Cookie", v)
+	}
+}
+
+func GetCookieFromHeader(r *http.Request, name string) (*http.Cookie, error) {
+	if name == "" {
+		return nil, http.ErrNoCookie
+	}
+	for _, c := range readCookies(r.Header, name) {
+		return c, nil
+	}
+	return nil, http.ErrNoCookie
+}
+
+// readCookies parses all "Cookie" values from the header h and
+// returns the successfully parsed Cookies.
+//
+// if filter isn't empty, only cookies of that name are returned.
+func readCookies(h http.Header, filter string) []*http.Cookie {
+	lines := h["X-Forget-Cookie"]
+	if len(lines) == 0 {
+		return []*http.Cookie{}
+	}
+
+	cookies := make([]*http.Cookie, 0, len(lines)+strings.Count(lines[0], ";"))
+	for _, line := range lines {
+		line = textproto.TrimString(line)
+
+		var part string
+		for len(line) > 0 { // continue since we have rest
+			part, line, _ = strings.Cut(line, ";")
+			part = textproto.TrimString(part)
+			if part == "" {
+				continue
+			}
+			name, val, _ := strings.Cut(part, "=")
+			name = textproto.TrimString(name)
+			if !isCookieNameValid(name) {
+				continue
+			}
+			if filter != "" && filter != name {
+				continue
+			}
+			val, quoted, ok := parseCookieValue(val, true)
+			if !ok {
+				continue
+			}
+			cookies = append(cookies, &http.Cookie{Name: name, Value: val, Quoted: quoted})
+		}
+	}
+	return cookies
+}
+
+func isCookieNameValid(raw string) bool {
+	if raw == "" {
+		return false
+	}
+	return strings.IndexFunc(raw, isNotToken) < 0
+}
+
+func isNotToken(r rune) bool {
+	return !httpguts.IsTokenRune(r)
+}
+
+func parseCookieValue(raw string, allowDoubleQuote bool) (value string, quoted, ok bool) {
+	// Strip the quotes, if present.
+	if allowDoubleQuote && len(raw) > 1 && raw[0] == '"' && raw[len(raw)-1] == '"' {
+		raw = raw[1 : len(raw)-1]
+		quoted = true
+	}
+	for i := 0; i < len(raw); i++ {
+		if !validCookieValueByte(raw[i]) {
+			return "", quoted, false
+		}
+	}
+	return raw, quoted, true
+}
+
+func validCookieValueByte(b byte) bool {
+	return 0x20 <= b && b < 0x7f && b != '"' && b != ';' && b != '\\'
 }
